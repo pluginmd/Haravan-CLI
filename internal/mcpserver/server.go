@@ -56,10 +56,16 @@ func NewServer(opts Options) (*mcpsrv.MCPServer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("build schema for %s: %w", t.Name, err)
 		}
-		mcpTool := mcp.NewTool(t.Name,
-			mcp.WithDescription(toolDescription(t)),
-			mcp.WithRawInputSchema(json.RawMessage(schema)),
-		)
+		// Construct the mcp.Tool struct directly rather than via NewTool:
+		// NewTool unconditionally initialises InputSchema.Type="object",
+		// which then collides with RawInputSchema at marshal time
+		// (errToolSchemaConflict). By leaving InputSchema zero we tell
+		// mcp-go to marshal only our raw schema.
+		mcpTool := mcp.Tool{
+			Name:           t.Name,
+			Description:    toolDescription(t),
+			RawInputSchema: json.RawMessage(schema),
+		}
 		srv.AddTool(mcpTool, adapt(deps, t))
 	}
 
