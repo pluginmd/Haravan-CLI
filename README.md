@@ -1,315 +1,207 @@
-# Haravan MCP
+# haravan-cli
 
-Haravan E-commerce OpenAPI MCP Server — Kết nối AI assistants với Haravan stores.
+Unified Go CLI and Model Context Protocol (MCP) server for the Haravan
+e-commerce platform. One binary, two surfaces:
 
-MCP (Model Context Protocol) server cho phép AI assistants (Claude, Cursor, Trae) tương tác trực tiếp với Haravan APIs: quản lý sản phẩm, đơn hàng, khách hàng, tồn kho, webhooks và nhiều hơn.
+- **CLI** — 70 subcommands across 8 domains for scripting and debugging.
+- **MCP server** — every command is also exposed as an MCP tool over
+  stdio or HTTP/SSE, ready for Claude.ai, Claude Code, Cursor, and any
+  other MCP-capable client.
 
-*[English](#english) below.*
+No Node, no npm, no runtime dependencies — a single static binary (~15 MB).
 
 ---
 
-## Bắt đầu nhanh
+## Install
 
-### Sử dụng với Claude / Cursor / Trae
+### `go install`
 
-Thêm vào file cấu hình MCP:
+```bash
+go install github.com/pluginmd/haravan-cli@latest
+```
+
+### From source
+
+```bash
+git clone https://github.com/pluginmd/haravan-cli
+cd haravan-cli
+make install        # installs to /usr/local/bin/haravan-cli
+```
+
+### Docker
+
+```bash
+cp docker/.env.example docker/.env
+# Edit docker/.env and set HARAVAN_ACCESS_TOKEN
+docker compose -f docker/docker-compose.yml up -d
+```
+
+The container exposes MCP over HTTP/SSE on `:4567`.
+
+---
+
+## Configure
+
+Two credential flows are supported.
+
+### Private app token (simplest)
+
+```bash
+export HARAVAN_ACCESS_TOKEN=...
+haravan-cli shop get
+```
+
+### OAuth 2.0
+
+```bash
+haravan-cli config set --app-id=YOUR_APP_ID --app-secret=YOUR_APP_SECRET
+haravan-cli auth login                  # opens browser, stores token
+haravan-cli auth status                 # inspect stored tokens
+```
+
+Config lives at `~/.haravan-cli/` (override with `HARAVAN_CLI_HOME`):
+
+```
+~/.haravan-cli/
+├── config.json     # api_base, app_id, app_secret
+└── tokens.json     # keyed by app_id, 0600 perms, atomic writes
+```
+
+### Resolution order
+
+For every API call the token is resolved in this order:
+
+1. `--token` flag
+2. `HARAVAN_ACCESS_TOKEN` env
+3. Stored OAuth token for the effective `app_id`
+   (auto-refresh when expired + refresh token present)
+
+---
+
+## CLI usage
+
+Top-level commands:
+
+```text
+haravan-cli
+├── auth              login, logout, status
+├── config            show, set, path
+├── mcp               serve (stdio | HTTP/SSE), tools
+├── orders            13 tools: list, get, create, confirm, close, cancel, …
+├── products          11 tools: list, get, create, variants, …
+├── customers         14 tools: list, search, groups, addresses, …
+├── inventory         5  tools: adjustments, adjust_or_set, locations
+├── shop              6  tools: shop info, locations, users, shipping_rates
+├── content           11 tools: pages, blogs, articles, script_tags
+├── webhooks          3  tools: list, subscribe, unsubscribe
+└── smart             7  tools: orders_summary, top_products, rfm, …
+```
+
+Every tool is both a shell subcommand and an MCP tool. Handler code is
+written once and dispatched from whichever surface called it.
+
+### Examples
+
+```bash
+# Shop info
+haravan-cli shop get
+
+# List today's orders (with auto-pagination)
+haravan-cli orders list --status=any --created_at_min=2026-04-24T00:00:00Z --fetch_all
+
+# Create an order from a file
+haravan-cli orders create --body=@order.json
+
+# Smart: 30-day summary with prior-period comparison
+haravan-cli smart orders_summary
+
+# RFM customer segmentation
+haravan-cli smart customer_segments --min_orders=1
+
+# List everything the MCP server will advertise
+haravan-cli mcp tools
+```
+
+JSON bodies for create/update commands accept either inline JSON or
+`@path/to/file.json`, and the outer envelope (`{"order": …}`,
+`{"product": …}`, etc.) is added automatically if you pass the bare
+object.
+
+---
+
+## MCP server
+
+Start a stdio server (the default an MCP client expects):
+
+```bash
+haravan-cli mcp serve
+```
+
+Start an HTTP/SSE server for network-accessible integrations:
+
+```bash
+haravan-cli mcp serve --http --addr=:4567
+```
+
+### Claude Code / Desktop configuration
 
 ```json
 {
   "mcpServers": {
-    "haravan-mcp": {
-      "command": "npx",
-      "args": ["-y", "haravan-mcp", "mcp", "-t", "<your_access_token>"]
+    "haravan": {
+      "command": "haravan-cli",
+      "args": ["mcp", "serve"],
+      "env": {
+        "HARAVAN_ACCESS_TOKEN": "your-token"
+      }
     }
   }
 }
 ```
 
-### Sử dụng với Docker (HTTP mode)
+### Cursor (`~/.cursor/mcp.json`)
 
-```bash
-# Clone repo
-git clone <repo-url> && cd HaravanMCP
+Same shape as above.
 
-# Cấu hình token
-cp docker/.env.example docker/.env
-# Sửa docker/.env → điền HARAVAN_ACCESS_TOKEN
+### Claude Skill
 
-# Chạy
-docker compose -f docker/docker-compose.yml up -d
-
-# MCP endpoint: http://localhost:4567/mcp
-# Health check: http://localhost:4567/health
-```
-
-### Sử dụng với OAuth 2.0
-
-```bash
-# Bước 1: Login
-npx haravan-mcp login -a <app_id> -s <app_secret>
-
-# Bước 2: Cấu hình MCP
-{
-  "mcpServers": {
-    "haravan-mcp": {
-      "command": "npx",
-      "args": ["-y", "haravan-mcp", "mcp", "-a", "<app_id>", "--oauth"]
-    }
-  }
-}
-```
+The `claudeskill/haravan-mcp/` directory contains a reasoning layer
+designed for Claude.ai. It documents every tool, the decision tree
+for which tool to use when, and Vietnam-specific e-commerce
+benchmarks. Upload the folder to Claude.ai as a Skill or copy it to
+`~/.claude/skills/haravan-mcp/` for Claude Code.
 
 ---
 
-## Kiến trúc 2 lớp
+## Environment variables
 
-```
-Claude Skill Layer (AI reasoning, insights, formatting)
-         │
-         │ MCP Protocol
-         ▼
-MCP Server Layer (pagination, rate limiting, aggregation)
-         │
-         │ HTTPS + Bearer Token
-         ▼
-Haravan REST API (apis.haravan.com)
-```
-
-**Smart Tools (7)**: Server-side pagination + aggregation cho data lớn
-**Base Tools (63)**: 1:1 mapping với Haravan API cho detail/CRUD
-
----
-
-## Smart Tools
-
-| Tool | Chức năng |
-|------|-----------|
-| `hrv_orders_summary` | Tổng DT, AOV, status/source/cancel breakdown, so sánh kỳ trước |
-| `hrv_top_products` | Top N sản phẩm theo doanh thu + variant breakdown |
-| `hrv_order_cycle_time` | Median/p90 time-to-confirm/close, đơn stuck |
-| `hrv_customer_segments` | RFM 8 segments + action suggestions |
-| `hrv_inventory_health` | Phân loại: out_of_stock / low / dead / healthy |
-| `hrv_stock_reorder_plan` | DSR + reorder point + suggested qty per variant |
-| `hrv_inventory_imbalance` | Cross-location imbalance + transfer suggestions |
-
----
-
-## Base Tools (63 tổng)
-
-| Category | Tools | Mô tả |
-|----------|-------|-------|
-| Customers | 14 | CRUD khách hàng + địa chỉ |
-| Orders | 13 | CRUD đơn hàng + transactions |
-| Products | 11 | CRUD sản phẩm + variants |
-| Inventory | 5 | Kiểm kho + locations |
-| Shop | 6 | Shop info, kho, nhân viên |
-| Content | 11 | Pages, blogs, articles, script tags |
-| Webhooks | 3 | Subscribe/unsubscribe |
-
----
-
-## Presets
-
-```bash
-# Smart tools only (dashboard/analytics)
-haravan-mcp mcp -t <token> --tools "preset.smart"
-
-# Default (smart + detail drill-down)
-haravan-mcp mcp -t <token> --tools "preset.default"
-
-# Full CRUD cho specific resources
-haravan-mcp mcp -t <token> --tools "preset.products,preset.orders"
-
-# Tất cả tools
-haravan-mcp mcp -t <token> --tools "all"
-
-# Mix presets + individual tools
-haravan-mcp mcp -t <token> --tools "preset.smart,haravan_webhooks_list"
-```
-
-| Preset | Tools | Use case |
-|--------|-------|---------|
-| `preset.default` | 17 | AI assistant — smart + drill-down |
-| `preset.smart` | 7 | Dashboard, analytics |
-| `preset.light` | 7 | Read-only minimal |
-| `preset.products` | 11 | Product management |
-| `preset.orders` | 13 | Order management |
-| `preset.customers` | 14 | Customer management |
-| `preset.inventory` | 7 | Inventory management |
-| `preset.content` | 11 | Content management |
-| `preset.webhooks` | 3 | Webhook management |
-
----
-
-## CLI Commands
-
-```bash
-haravan-mcp mcp -t <token>                   # Start server (stdio)
-haravan-mcp mcp -t <token> -m http -p 3000   # Start server (HTTP)
-haravan-mcp mcp -t <token> --tools "preset.smart"  # Custom tools
-
-haravan-mcp login -a <app_id> -s <secret>    # OAuth login
-haravan-mcp whoami                            # Show stored tokens
-haravan-mcp logout -a <app_id>               # Remove token
-haravan-mcp logout --all                      # Remove all tokens
-
-haravan-mcp tools                             # List all tools
-haravan-mcp tools --presets                   # Show presets
-haravan-mcp tools --project products          # Filter by category
-```
-
----
-
-## Claude Skill — Tri thức tối ưu
-
-Ngoài MCP Server (70 tools), dự án bao gồm **Claude Skill** (`claudeskill/haravan-mcp/`) — bộ não phân tích được upload lên claude.ai, dạy Claude cách sử dụng MCP tools hiệu quả nhất.
-
-### Token Efficiency — Lý do tồn tại
-
-| Scenario | Không tối ưu | Có Skill + Smart Tools | Tiết kiệm |
-|----------|-------------|------------------------|------------|
-| "Doanh thu tháng này" | 17 API calls, ~250,000 tokens | 1 tool call, ~300 tokens | **99.9%** |
-| "Top 10 sản phẩm" | 17+342 calls, ~800,000 tokens | 1 tool call, ~500 tokens | **99.9%** |
-| "Phân tích RFM khách hàng" | 50+ calls, ~500,000 tokens | 1 tool call, ~800 tokens | **99.8%** |
-| "Tổng quan cửa hàng" | 100+ calls, ~1,500,000 tokens | 3 calls song song, ~1,200 tokens | **99.9%** |
-
-### Tri thức tích hợp trong Skill
-
-**20+ công thức vận hành e-commerce** (từ `references/insights-formulas.md`):
-- **Order Operations**: ODR (Order Defect Rate), Revenue at Risk, Payment Collection Efficiency, Order Cycle Time Breakdown
-- **Inventory Intelligence**: ABC-FSN Analysis (phân loại SKU), DSR/DOS (tốc độ bán/ngày tồn kho), Shrinkage Detection, GMROI
-- **Customer Analytics**: RFM Scoring (quintile), Purchase Gap Analysis, Customer Concentration Risk, Acquisition vs Retention Economics
-- **Product Intelligence**: Catalog Health Score (12 tiêu chí, thang 0-100), Variant Performance Matrix, Product Lifecycle Detection, Price-Volume Curve
-
-**Benchmarks ngành e-commerce Việt Nam** (từ `references/mcp-tools.md`):
-| Metric | Tốt | TB | Cần cải thiện |
-|--------|-----|-----|---------------|
-| Cancel Rate | <3% | 3-5% | >5% |
-| Repeat Purchase Rate | >30% | 20-30% | <20% |
-| COD Fail Rate | <15% | 15-25% | >25% |
-| Catalog Health Score | >80 | 60-80 | <60 |
-| Discount Penetration | 10-20% | 20-40% | >40% |
-
-**10 kịch bản phân tích có sẵn** (Decision Tree trong SKILL.md):
-1. **Store Pulse** — tổng quan cửa hàng (3 calls song song)
-2. **Revenue Breakdown** — phân tích đa chiều: kênh, sản phẩm, địa lý (4 calls)
-3. **Order Pipeline** — bottleneck, cycle time, cancel analysis (3 calls)
-4. **Stock Health** — phân loại kho, đề xuất nhập, cân bằng đa chi nhánh (3 calls)
-5. **Customer RFM** — 7 segments + marketing actions cho từng segment (2 calls)
-6. **Product Performance** — best sellers, catalog health, discount ROI
-7. **Operations Scorecard** — chấm điểm 10 chỉ số (1-10), top 3 mạnh/yếu (5-6 calls)
-8. **COD Monitor** — fail rate theo tỉnh, risk scoring
-9. **Smart Search** — tìm đơn/khách/sản phẩm bằng ngôn ngữ tự nhiên
-10. **Store Action** — thao tác nhanh với xác nhận trước khi write
-
-**5 ví dụ output thực tế** (từ `references/examples.md`) với data giả — Claude học cách format bảng, viết insight, xử lý lỗi.
-
-### Cách cài Skill
-
-**Claude.ai**: Upload `haravan-mcp-skill.zip` tại claude.ai/skills
-
-**Claude Code**: Copy thư mục `claudeskill/haravan-mcp/` vào `~/.claude/skills/haravan-mcp/`
-
-### Cấu trúc Skill
-
-```
-claudeskill/haravan-mcp/
-├── SKILL.md (718 dòng)
-│   ├── Phần 1: 5 quy tắc bắt buộc
-│   ├── Phần 2: Decision tree — câu hỏi → tool nào
-│   ├── Phần 3: 10 kịch bản phân tích chi tiết (output templates)
-│   ├── Phần 4: Xử lý lỗi (401/403/429/500/network)
-│   ├── Phần 5: Multi-turn drill-down
-│   ├── Phần 6: Cách viết insight xuất sắc (SAI vs ĐÚNG)
-│   └── Phần 7: Anti-patterns
-└── references/
-    ├── mcp-tools.md — Tool catalog + benchmarks ngành
-    ├── insights-formulas.md — 20+ công thức: ODR, RFM, DSR, GMROI, ABC-FSN...
-    └── examples.md — 5 ví dụ output hoàn chỉnh với data thực tế
-```
+| Variable | Purpose |
+|----------|---------|
+| `HARAVAN_ACCESS_TOKEN` | Private app token |
+| `HARAVAN_APP_ID` | OAuth client_id |
+| `HARAVAN_APP_SECRET` | OAuth client_secret |
+| `HARAVAN_API_BASE` | Override main API base URL |
+| `HARAVAN_WEBHOOK_BASE` | Override webhook API base URL |
+| `HARAVAN_CLI_HOME` | Override config/token directory |
+| `HARAVAN_LOG_LEVEL` | `debug` / `info` / `warn` / `error` / `off` |
 
 ---
 
 ## Development
 
 ```bash
-npm install          # Install dependencies
-npm run build        # Build TypeScript
-npm run dev -- mcp -t <token>   # Dev mode
-npm test             # Run tests
-npm run format       # Prettier format
+make build               # go build with version injection
+make test                # go test -race ./...
+make vet                 # go vet ./...
+make lint                # requires golangci-lint
+make release-snapshot    # local goreleaser snapshot
 ```
 
----
-
-## Tài liệu
-
-| Doc | Nội dung |
-|-----|---------|
-| [docs/project-overview-pdr.md](docs/project-overview-pdr.md) | Tổng quan dự án, tầm nhìn, roadmap |
-| [docs/system-architecture.md](docs/system-architecture.md) | Kiến trúc: transport, middleware, auth flow |
-| [docs/code-standards.md](docs/code-standards.md) | Quy chuẩn code, cấu trúc thư mục, patterns |
-| [docs/design-guidelines.md](docs/design-guidelines.md) | Tư duy thiết kế MCP + Claude Skill |
-| [docs/deployment-guide.md](docs/deployment-guide.md) | Docker, Cloudflare Tunnel, troubleshooting |
-| [docs/codebase-summary.md](docs/codebase-summary.md) | Tóm tắt codebase, dependencies, data flow |
+Architecture, design decisions, and contribution guidance live in
+[docs/](docs/).
 
 ---
 
-## Environment Variables
+## Licence
 
-| Variable | Mô tả |
-|----------|-------|
-| `HARAVAN_ACCESS_TOKEN` | Private app token |
-| `HARAVAN_APP_ID` | OAuth App ID |
-| `HARAVAN_APP_SECRET` | OAuth App Secret |
-
----
-
-## Tác giả
-
-**Nguyễn Ngọc Tuấn**
-Founder — Transform Group | Lark Platinum Partner
-[Facebook](https://www.facebook.com/khongphaituan)
-
-## License
-
-MIT
-
----
-
-<a name="english"></a>
-## English
-
-### What is Haravan MCP?
-
-An MCP (Model Context Protocol) server that connects AI assistants (Claude, Cursor, Trae) to Haravan e-commerce stores. Manage products, orders, customers, inventory, and more through natural language.
-
-### Architecture
-
-Two-layer design:
-- **MCP Server** (7 smart tools): Server-side pagination, rate limiting, aggregation for large datasets
-- **Claude Skill** (SKILL.md): AI reasoning, insights, formatting — handles simple analysis from smart tool outputs
-
-### Quick Start
-
-```json
-{
-  "mcpServers": {
-    "haravan-mcp": {
-      "command": "npx",
-      "args": ["-y", "haravan-mcp", "mcp", "-t", "<your_token>"]
-    }
-  }
-}
-```
-
-### Docker
-
-```bash
-docker compose -f docker/docker-compose.yml up -d
-# MCP endpoint: http://localhost:4567/mcp
-```
-
-### Documentation
-
-All docs are in Vietnamese (default) with English summaries at the bottom of each file. See [docs/](docs/) directory.
+MIT — see [LICENSE](LICENSE).

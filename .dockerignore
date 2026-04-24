@@ -1,0 +1,22 @@
+/haravan-cli
+/haravan-cli.exe
+/bin/
+/dist/
+/.cache/
+/coverage.out
+
+# VCS / IDE
+.git/
+.github/
+.idea/
+.vscode/
+
+# Artifacts
+*.log
+*.test
+*.prof
+
+# Docs + legacy TS source (not needed for the Go build)
+legacy/
+docs/
+claudeskill/

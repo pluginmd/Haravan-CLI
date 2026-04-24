@@ -1,0 +1,25 @@
+services:
+  haravan-cli:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-local}
+        DATE: ${DATE:-}
+    image: haravan-cli:latest
+    container_name: haravan-cli
+    restart: unless-stopped
+    environment:
+      HARAVAN_ACCESS_TOKEN: ${HARAVAN_ACCESS_TOKEN}
+      HARAVAN_API_BASE: ${HARAVAN_API_BASE:-https://apis.haravan.com}
+      HARAVAN_WEBHOOK_BASE: ${HARAVAN_WEBHOOK_BASE:-https://webhook.haravan.com}
+      HARAVAN_LOG_LEVEL: ${HARAVAN_LOG_LEVEL:-info}
+    ports:
+      - "${HARAVAN_MCP_PORT:-4567}:4567"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4567/sse"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
