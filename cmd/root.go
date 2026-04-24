@@ -13,6 +13,18 @@ import (
 	"github.com/pluginmd/haravan-cli/internal/cmdutil"
 	"github.com/pluginmd/haravan-cli/internal/config"
 	"github.com/pluginmd/haravan-cli/internal/logger"
+	"github.com/pluginmd/haravan-cli/pkg/tools"
+
+	// Register all tool packages. init() side-effects populate
+	// tools.Default(). Keep alphabetically sorted.
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/content"
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/customers"
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/inventory"
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/orders"
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/products"
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/shop"
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/smart"
+	_ "github.com/pluginmd/haravan-cli/pkg/tools/webhooks"
 )
 
 // Execute builds the root command and runs it with os.Args.
@@ -53,9 +65,13 @@ Model Context Protocol tools for AI assistants.`,
 
 	root.PersistentFlags().StringVar(&logLevel, "log-level", "", "log level: debug|info|warn|error|off")
 
+	cmdutil.RegisterAuthFlags(root)
+
 	root.AddCommand(NewVersionCmd(f))
 	root.AddCommand(auth.NewCmd(f))
 	root.AddCommand(cfg.NewCmd(f))
+
+	tools.MountAll(root, f)
 
 	return root
 }
