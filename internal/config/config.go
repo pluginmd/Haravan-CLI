@@ -13,6 +13,7 @@ import (
 const (
 	EnvHome        = "HARAVAN_CLI_HOME"
 	EnvAPIBase     = "HARAVAN_API_BASE"
+	EnvWebhookBase = "HARAVAN_WEBHOOK_BASE"
 	EnvAccessToken = "HARAVAN_ACCESS_TOKEN"
 	EnvAppID       = "HARAVAN_APP_ID"
 	EnvAppSecret   = "HARAVAN_APP_SECRET"
@@ -20,13 +21,15 @@ const (
 )
 
 const (
-	DefaultAPIBase = "https://apis.haravan.com"
-	configFileName = "config.json"
+	DefaultAPIBase     = "https://apis.haravan.com"
+	DefaultWebhookBase = "https://webhook.haravan.com"
+	configFileName     = "config.json"
 )
 
 // Config is the persisted user configuration.
 type Config struct {
 	APIBase     string `json:"api_base,omitempty"`
+	WebhookBase string `json:"webhook_base,omitempty"`
 	AppID       string `json:"app_id,omitempty"`
 	AppSecret   string `json:"app_secret,omitempty"`
 	DefaultAuth string `json:"default_auth,omitempty"` // "token" | "oauth"
@@ -109,4 +112,15 @@ func (c *Config) ResolveAPIBase() string {
 		return c.APIBase
 	}
 	return DefaultAPIBase
+}
+
+// ResolveWebhookBase resolves the effective webhook base URL: env > config > default.
+func (c *Config) ResolveWebhookBase() string {
+	if v := os.Getenv(EnvWebhookBase); v != "" {
+		return v
+	}
+	if c != nil && c.WebhookBase != "" {
+		return c.WebhookBase
+	}
+	return DefaultWebhookBase
 }

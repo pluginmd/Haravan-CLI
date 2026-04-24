@@ -34,44 +34,67 @@ func RegisterAuthFlags(cmd *cobra.Command) {
 // ready-to-use Haravan client. It is the single entry point used by tool
 // handlers, mcp serve, and the raw `api` command.
 func BuildClient(ctx context.Context, cmd *cobra.Command, cfg *config.Config) (*client.Client, error) {
-	flagVal := func(name string) string {
-		if cmd == nil {
-			return ""
-		}
-		v, err := cmd.Flags().GetString(name)
-		if err != nil {
-			return ""
-		}
-		return v
-	}
-
-	store, err := auth.NewTokenStore()
+	token, err := resolveToken(ctx, cmd, cfg)
 	if err != nil {
 		return nil, err
 	}
-	res := &auth.Resolver{
-		Token:     flagVal(FlagToken),
-		AppID:     flagVal(FlagAppID),
-		AppSecret: flagVal(FlagAppSecret),
-		Store:     store,
-		Config:    cfg,
-	}
-	token, err := res.Resolve(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	base := flagVal(FlagAPIBase)
+	base := flagVal(cmd, FlagAPIBase)
 	if base == "" && cfg != nil {
 		base = cfg.ResolveAPIBase()
 	}
 	if base == "" {
 		base = config.DefaultAPIBase
 	}
-
 	c, err := client.New(client.Options{BaseURL: base, AccessToken: token})
 	if err != nil {
 		return nil, fmt.Errorf("build client: %w", err)
 	}
 	return c, nil
+}
+
+// BuildWebhookClient is like BuildClient but targets the webhook.haravan.com base.
+// Used by webhook tools which speak to a different host than the main API.
+func BuildWebhookClient(ctx context.Context, cmd *cobra.Command, cfg *config.Config) (*client.Client, error) {
+	token, err := resolveToken(ctx, cmd, cfg)
+	if err != nil {
+		return nil, err
+	}
+	var base string
+	if cfg != nil {
+		base = cfg.ResolveWebhookBase()
+	}
+	if base == "" {
+		base = config.DefaultWebhookBase
+	}
+	c, err := client.New(client.Options{BaseURL: base, AccessToken: token})
+	if err != nil {
+		return nil, fmt.Errorf("build webhook client: %w", err)
+	}
+	return c, nil
+}
+
+func resolveToken(ctx context.Context, cmd *cobra.Command, cfg *config.Config) (string, error) {
+	store, err := auth.NewTokenStore()
+	if err != nil {
+		return "", err
+	}
+	res := &auth.Resolver{
+		Token:     flagVal(cmd, FlagToken),
+		AppID:     flagVal(cmd, FlagAppID),
+		AppSecret: flagVal(cmd, FlagAppSecret),
+		Store:     store,
+		Config:    cfg,
+	}
+	return res.Resolve(ctx)
+}
+
+func flagVal(cmd *cobra.Command, name string) string {
+	if cmd == nil {
+		return ""
+	}
+	v, err := cmd.Flags().GetString(name)
+	if err != nil {
+		return ""
+	}
+	return v
 }

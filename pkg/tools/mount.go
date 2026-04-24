@@ -54,10 +54,18 @@ func defaultDepsBuilder(f *cmdutil.Factory) DepsBuilder {
 		if err != nil {
 			return nil, err
 		}
+		// Webhook client shares the token; base URL differs. Built eagerly
+		// so webhook tools don't need to know about config plumbing.
+		wc, err := cmdutil.BuildWebhookClient(cmd.Context(), cmd, cfg)
+		if err != nil {
+			// Non-fatal: non-webhook tools still work. Log and continue.
+			logger.Debugf("webhook client unavailable: %v", err)
+		}
 		return &Deps{
-			Client: c,
-			Logger: logger.Default(),
-			IO:     f.IOStreams,
+			Client:        c,
+			WebhookClient: wc,
+			Logger:        logger.Default(),
+			IO:            f.IOStreams,
 		}, nil
 	}
 }

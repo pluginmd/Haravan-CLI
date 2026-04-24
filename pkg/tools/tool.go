@@ -60,7 +60,8 @@ type Tool struct {
 // Deps holds the resources a Handler typically needs. Additional fields
 // can be introduced without breaking existing Handlers.
 type Deps struct {
-	Client *client.Client
-	Logger *logger.Logger
-	IO     *iostreams.IOStreams
+	Client        *client.Client
+	WebhookClient *client.Client // webhook.haravan.com — used only by webhook tools
+	Logger        *logger.Logger
+	IO            *iostreams.IOStreams
 }

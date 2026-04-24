@@ -2,8 +2,6 @@ package orders
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/pluginmd/haravan-cli/pkg/tools"
@@ -128,7 +126,7 @@ addresses, tags, discount_codes, note, source_name are all supported.`,
 			{Name: "body", Type: tools.FlagJSON, Description: `Haravan order payload, e.g. {"order":{"line_items":[...]}}`, Required: true},
 		},
 		Handler: func(ctx context.Context, deps *tools.Deps, in tools.Input) (*tools.Result, error) {
-			body, err := unwrapOrWrap(in.JSON("body"), "order")
+			body, err := tools.EnvelopeWrap(in.JSON("body"), "order")
 			if err != nil {
 				return nil, err
 			}
@@ -153,7 +151,7 @@ func registerUpdate() {
 			{Name: "body", Type: tools.FlagJSON, Description: `Haravan order patch, e.g. {"order":{"note":"..."}}`, Required: true},
 		},
 		Handler: func(ctx context.Context, deps *tools.Deps, in tools.Input) (*tools.Result, error) {
-			body, err := unwrapOrWrap(in.JSON("body"), "order")
+			body, err := tools.EnvelopeWrap(in.JSON("body"), "order")
 			if err != nil {
 				return nil, err
 			}
@@ -308,7 +306,7 @@ func registerTransactions() {
 			{Name: "body", Type: tools.FlagJSON, Description: `Transaction payload, e.g. {"transaction":{"amount":100,"kind":"Sale"}}`, Required: true},
 		},
 		Handler: func(ctx context.Context, deps *tools.Deps, in tools.Input) (*tools.Result, error) {
-			body, err := unwrapOrWrap(in.JSON("body"), "transaction")
+			body, err := tools.EnvelopeWrap(in.JSON("body"), "transaction")
 			if err != nil {
 				return nil, err
 			}
@@ -322,26 +320,4 @@ func registerTransactions() {
 	})
 }
 
-// unwrapOrWrap accepts either a bare resource object or the already-wrapped
-// envelope, and returns the wrapped form the Haravan API expects.
-//
-//	input {"line_items":[...]}        wrapper "order" -> {"order":{...}}
-//	input {"order":{"line_items":[]}} wrapper "order" -> unchanged
-func unwrapOrWrap(raw json.RawMessage, wrapper string) (json.RawMessage, error) {
-	if len(raw) == 0 {
-		return nil, errors.New("empty body")
-	}
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return nil, fmt.Errorf("body must be a JSON object: %w", err)
-	}
-	if _, ok := probe[wrapper]; ok {
-		return raw, nil
-	}
-	wrapped, err := json.Marshal(map[string]json.RawMessage{wrapper: raw})
-	if err != nil {
-		return nil, err
-	}
-	return wrapped, nil
-}
 
