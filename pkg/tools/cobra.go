@@ -182,14 +182,21 @@ func stringSliceFlag(fs *pflag.FlagSet, fl Flag, def []string) *[]string {
 	return &out
 }
 
+// deriveSubcommandName strips the shared tool-name prefix so the cobra
+// subcommand reads naturally. It tries the most specific prefix first:
+//
+//	haravan_shop_get            -> get                (matches category)
+//	haravan_locations_get       -> locations_get      (falls back to haravan_)
+//	haravan_customer_addresses_list -> customer_addresses_list
+//	hrv_orders_summary          -> orders_summary     (smart prefix)
 func deriveSubcommandName(t *Tool) string {
 	name := t.Name
-	prefix := fmt.Sprintf("haravan_%s_", t.Category)
-	if strings.HasPrefix(name, prefix) {
-		return strings.TrimPrefix(name, prefix)
+	if catPrefix := fmt.Sprintf("haravan_%s_", t.Category); strings.HasPrefix(name, catPrefix) {
+		return strings.TrimPrefix(name, catPrefix)
 	}
-	// Smart tools live under `haravan-cli smart <name>` without the
-	// haravan_ prefix in the sub-slug.
+	if strings.HasPrefix(name, "haravan_") {
+		return strings.TrimPrefix(name, "haravan_")
+	}
 	if strings.HasPrefix(name, "hrv_") {
 		return strings.TrimPrefix(name, "hrv_")
 	}
