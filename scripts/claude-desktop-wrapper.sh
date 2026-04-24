@@ -8,14 +8,39 @@
 # Delete with:
 #
 #   security delete-generic-password -a "$USER" -s "haravan-cli-token"
+#
+# IMPORTANT — installation location matters on macOS:
+#
+# macOS TCC (Transparency, Consent, Control) silently refuses to execute
+# shell scripts from ~/Downloads (and a few other protected folders) even
+# for apps that can happily execute compiled binaries there. Claude Desktop
+# is sandboxed and hits this.
+#
+# Install this wrapper to ~/.local/bin (or /usr/local/bin) instead. The
+# repo copy exists only as the canonical source; the Makefile install-
+# target / manual `cp` puts it somewhere TCC permits.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="${SCRIPT_DIR}/../haravan-cli"
+# Override this path with HARAVAN_CLI_BINARY env if you install the Go
+# binary to /usr/local/bin or similar. Default assumes the repo layout.
+BINARY="${HARAVAN_CLI_BINARY:-}"
+if [[ -z "$BINARY" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  # When installed to ~/.local/bin, SCRIPT_DIR is unrelated to the repo,
+  # so fall back to a well-known path set by the installer.
+  if [[ -x "${SCRIPT_DIR}/../haravan-cli" ]]; then
+    BINARY="${SCRIPT_DIR}/../haravan-cli"
+  elif [[ -x "$HOME/.local/bin/haravan-cli" ]]; then
+    BINARY="$HOME/.local/bin/haravan-cli"
+  elif [[ -x "/usr/local/bin/haravan-cli" ]]; then
+    BINARY="/usr/local/bin/haravan-cli"
+  elif command -v haravan-cli >/dev/null 2>&1; then
+    BINARY="$(command -v haravan-cli)"
+  fi
+fi
 
-if [[ ! -x "$BINARY" ]]; then
-  echo "haravan-cli binary not found at $BINARY" >&2
-  echo "Build it first: (cd '$(dirname "$BINARY")' && make build)" >&2
+if [[ -z "$BINARY" ]] || [[ ! -x "$BINARY" ]]; then
+  echo "haravan-cli binary not found. Set HARAVAN_CLI_BINARY env or install to ~/.local/bin or /usr/local/bin." >&2
   exit 1
 fi
 

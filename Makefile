@@ -11,7 +11,7 @@ LDFLAGS  := -s -w \
             -X $(MODULE)/internal/build.Date=$(DATE)
 PREFIX   ?= /usr/local
 
-.PHONY: all build install uninstall clean test vet lint tidy run release-snapshot
+.PHONY: all build install uninstall clean test vet lint tidy run release-snapshot install-claude-wrapper
 
 all: build
 
@@ -49,3 +49,14 @@ run: build
 release-snapshot:
 	@command -v goreleaser >/dev/null 2>&1 || { echo "goreleaser not installed"; exit 1; }
 	goreleaser release --snapshot --clean
+
+# Install the Claude Desktop wrapper to ~/.local/bin so macOS TCC doesn't
+# refuse to spawn it from ~/Downloads. Requires the token to already be
+# stored in Keychain under service=haravan-cli-token, account=$USER.
+install-claude-wrapper:
+	@install -d $(HOME)/.local/bin
+	@install -m 0755 scripts/claude-desktop-wrapper.sh $(HOME)/.local/bin/haravan-mcp
+	@echo "installed: $(HOME)/.local/bin/haravan-mcp"
+	@echo ""
+	@echo "Point Claude Desktop at it:"
+	@echo '  "haravan": { "command": "$(HOME)/.local/bin/haravan-mcp", "args": ["mcp", "serve"] }'
