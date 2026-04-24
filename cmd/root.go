@@ -7,6 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/pluginmd/haravan-cli/cmd/auth"
+	"github.com/pluginmd/haravan-cli/cmd/cfg"
 	"github.com/pluginmd/haravan-cli/internal/build"
 	"github.com/pluginmd/haravan-cli/internal/cmdutil"
 	"github.com/pluginmd/haravan-cli/internal/config"
@@ -52,6 +54,8 @@ Model Context Protocol tools for AI assistants.`,
 	root.PersistentFlags().StringVar(&logLevel, "log-level", "", "log level: debug|info|warn|error|off")
 
 	root.AddCommand(NewVersionCmd(f))
+	root.AddCommand(auth.NewCmd(f))
+	root.AddCommand(cfg.NewCmd(f))
 
 	return root
 }
