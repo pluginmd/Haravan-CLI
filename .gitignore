@@ -1,8 +1,32 @@
-node_modules/
-dist/
-coverage/
-.env
-docker/.env
-*.log
+# Build output
+/haravan-cli
+/haravan-cli.exe
+/bin/
+/dist/
+/.cache/
+
+# Go
+vendor/
+coverage.out
+*.test
+*.prof
+
+# OS
 .DS_Store
-plan/
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Env
+.env
+.env.local
+docker/.env
+
+# Logs
+*.log
+/log/
