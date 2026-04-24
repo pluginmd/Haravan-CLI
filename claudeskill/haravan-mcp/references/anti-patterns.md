@@ -179,11 +179,11 @@ Turn 2: Đọc orders_by_source từ Turn 1 → "Web chiếm 65% đơn, POS 23%,
 
 | Cần phân tích | Data sẵn có | ĐỪNG gọi thêm |
 |---------------|------------|----------------|
-| Channel breakdown | `orders_by_source` (web/pos/mobile) | ~~hrv_channel_mix~~ (đã xóa) |
-| Cancel analysis | `orders_by_status.cancelled` + `cancel_reasons` | ~~hrv_orders_cancel_analysis~~ (đã xóa) |
-| Discount overview | `discount_usage.orders_with_discount` + `total_discount_value` | ~~hrv_discount_analysis~~ (đã xóa) |
-| ODR | `(cancelled + refunded) / total_orders` | Tự tính |
-| Collection rate | `paid / (total - cancelled)` | Tự tính |
+| Channel breakdown | `orders_by_source` (web/pos/mobile) | Không có tool riêng — dùng data summary |
+| Cancel analysis | `orders_by_status.cancelled` + `cancel_reasons` | Không có tool riêng — dùng data summary |
+| Discount overview | `discount_usage.orders_with_discount` + `total_discount_value` | Không có tool riêng — dùng data summary |
+| ODR (Order Defect Rate) | `(cancelled + refunded) / total_orders` | Tự tính từ summary |
+| Collection rate | `paid / (total - cancelled)` | Tự tính từ summary |
 
 ### Từ hrv_customer_segments đã có sẵn:
 

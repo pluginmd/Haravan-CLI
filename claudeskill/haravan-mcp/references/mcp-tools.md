@@ -1,623 +1,875 @@
-# Haravan MCP — Danh mục Tool đầy đủ
+# Haravan MCP — Danh mục Tool đầy đủ (auto-generated)
 
-Kiến trúc 2 lớp: **MCP Server** (7 smart tools) xử lý pagination lớn + aggregation phức tạp. **Claude Skill** (bạn) phân tích, filter, so sánh, tạo insight từ data trả về.
+_Tài liệu này được sinh tự động từ schema MCP server (70 tool), KHÔNG sửa tay. Regenerate bằng `make skill-tools`._
 
-Nguyên tắc then chốt: Smart tools chỉ làm heavy lifting mà Claude KHÔNG thể làm hiệu quả (1000+ orders, full-population RFM, 200 inventory calls). Mọi thứ còn lại — Claude tự làm.
+Kiến trúc 2 lớp:
+- **MCP Server** exposed 70 tool: 7 **smart** (`hrv_*`, aggregate server-side) + 63 **base** (`haravan_*`, 1:1 Haravan REST).
+- **Claude Skill** (bạn) chọn đúng tool, truyền đúng params, phân tích & diễn giải.
 
----
-
-## PHẦN I: 7 SMART TOOLS (hrv_*)
-
-### 1. hrv_orders_summary
-
-**Mục đích**: Tổng hợp doanh thu, đơn hàng, phân bổ theo status/source/lý do hủy/discount — từ toàn bộ orders trong kỳ (có thể 10,000+ đơn, server tự pagination).
-
-**Input params**:
-| Param | Type | Default | Mô tả |
-|-------|------|---------|-------|
-| `date_from` | string (ISO 8601) | 30 ngày trước | Ngày bắt đầu, VD: "2026-03-01" |
-| `date_to` | string (ISO 8601) | Hôm nay | Ngày kết thúc, VD: "2026-03-31" |
-| `compare_prior` | boolean | true | Tự động so sánh cùng kỳ trước (cùng số ngày) |
-
-**Output — cấu trúc JSON đầy đủ**:
-```json
-{
-  "period": { "from": "2026-03-01", "to": "2026-03-31", "days": 31 },
-  "total_orders": 1847,
-  "total_revenue": 819234500,
-  "aov": 443400,
-  "orders_by_status": {
-    "paid": 1620,
-    "pending": 134,
-    "refunded": 26,
-    "cancelled": 67
-  },
-  "orders_by_source": {
-    "web": { "count": 1124, "revenue": 478200000 },
-    "pos": { "count": 512, "revenue": 289300000 },
-    "iphone": { "count": 145, "revenue": 36200000 },
-    "android": { "count": 58, "revenue": 12100000 },
-    "other": { "count": 8, "revenue": 3434500 }
-  },
-  "cancel_reasons": {
-    "customer": 38,
-    "inventory": 18,
-    "fraud": 3,
-    "declined": 8,
-    "other": 0
-  },
-  "discount_usage": {
-    "orders_with_discount": 412,
-    "total_discount_value": 18650000,
-    "unique_discount_codes": 23
-  },
-  "comparison": {
-    "revenue_change_pct": 12.3,
-    "orders_change_pct": 8.1,
-    "aov_change_pct": 3.9
-  }
-}
-```
-
-**Claude tự làm từ output này (KHÔNG cần gọi thêm tool)**:
-- **Channel breakdown**: Tính % mỗi kênh = `orders_by_source.web.count / total_orders × 100`. AOV per channel = revenue / count
-- **Cancel rate**: `orders_by_status.cancelled / total_orders × 100`
-- **ODR (Order Defect Rate)**: `(cancelled + refunded) / total_orders × 100`
-- **Cancel analysis by reason**: `cancel_reasons` đã breakdown sẵn — tính %, xác định root cause
-- **Cancel by channel**: Nếu cần → tính proxy từ cancel_reasons pattern (inventory cancel thường từ web)
-- **Discount penetration**: `discount_usage.orders_with_discount / total_orders × 100`
-- **Discount depth**: `total_discount_value / total_revenue × 100`
-- **Collection Rate**: `paid / (total_orders - cancelled) × 100`
-- **Outstanding estimate**: `pending × aov`
-- **Revenue comparison**: `comparison.revenue_change_pct` đã có sẵn
-- **COD overview tổng quát**: Ước tính từ `orders_by_source` (POS thường ít COD hơn web)
-
-**Khi nào DÙNG**: Mọi câu hỏi liên quan doanh thu, đơn hàng tổng quát, so sánh kỳ, phân bổ kênh, tỷ lệ hủy, tổng quan discount.
-
-**Khi nào KHÔNG dùng**: Khi cần chi tiết từng đơn cụ thể (→ `haravan_orders_get`), khi cần filter theo province/shipping (→ `haravan_orders_list`), khi cần per-code discount ROI (→ `haravan_orders_list` + parse).
+Nguyên tắc: dùng `hrv_*` cho aggregation lớn (>1000 records), dùng `haravan_*` cho detail/action/CRUD.
 
 ---
 
-### 2. hrv_top_products
+## 🧠 SMART TOOLS — server-side aggregation  _(7 tool)_
 
-**Mục đích**: Xếp hạng sản phẩm theo doanh thu trong kỳ, kèm variant breakdown. Server xử lý aggregation qua tất cả line_items của 1000+ đơn.
+### `hrv_customer_segments`
 
-**Input params**:
-| Param | Type | Default | Mô tả |
-|-------|------|---------|-------|
-| `date_from` | string | 30 ngày trước | Ngày bắt đầu |
-| `date_to` | string | Hôm nay | Ngày kết thúc |
-| `top_n` | integer | 10 | Số sản phẩm trả về (max: 50) |
+RFM analysis using quintile scoring. Classifies every customer into
+Champions, Loyal, Potential_Loyalists, New, At_Risk, Hibernating, Lost,
+or Others, and returns counts + revenue metrics + an action suggestion
+per segment.
 
-**Output — cấu trúc JSON**:
-```json
-{
-  "period": { "from": "2026-03-01", "to": "2026-03-31" },
-  "total_products_sold": 187,
-  "products": [
-    {
-      "rank": 1,
-      "product_id": "12345678",
-      "product_title": "Áo thun basic unisex",
-      "total_quantity": 342,
-      "total_revenue": 94050000,
-      "revenue_share_pct": 11.5,
-      "variant_breakdown": [
-        { "variant_title": "M / Trắng", "qty": 145, "revenue": 39875000 },
-        { "variant_title": "L / Đen", "qty": 98, "revenue": 26950000 },
-        { "variant_title": "S / Trắng", "qty": 67, "revenue": 18425000 }
-      ]
-    }
-  ]
-}
-```
+**Scopes:** `com.read_customers`
 
-**Claude tự làm từ output này**:
-- **Revenue concentration**: Top 3 products / total_revenue = mức độ phụ thuộc sản phẩm
-- **Variant hot nhất**: `variant_breakdown[0]` của mỗi product
-- **Price sweet spot**: `total_revenue / total_quantity` = ASP (Average Selling Price) per product
-- **ABC phân loại sơ bộ**: Top 20% products theo revenue → A-items, middle 30% → B, bottom 50% → C
-- **Sell-through proxy**: So sánh qty_sold vs inventory (nếu có từ inventory_health)
-- **Lifecycle signal**: Product rank thay đổi lớn so kỳ trước → Growth/Decline stage
-- **Bundle opportunities**: Products hay bán cùng nhau (cần orders_list để xác nhận)
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `min_orders` | integer |  | Minimum order count required to include a customer (default 0) |
 
-**Khi nào DÙNG**: Sản phẩm bán chạy nhất, revenue concentration, phân tích variant, ABC analysis sơ bộ.
+### `hrv_inventory_health`
 
-**Khi nào KHÔNG dùng**: Khi cần tất cả sản phẩm (kể cả không bán) → `haravan_products_list`. Khi cần catalog health scoring → `haravan_products_list`. Khi cần thông tin chi tiết sản phẩm (images, SEO, variants đầy đủ) → `haravan_products_get`.
+Analyze inventory across the first 100 products.
+Classifies variants as out_of_stock, low_stock, dead_stock (stock but no
+sales in the lookback window) or healthy. Returns summary counts, total
+dead-stock value, and top-10 lists.
 
----
+**Scopes:** `com.read_inventories, com.read_products`
 
-### 3. hrv_order_cycle_time
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `days_for_dead_stock` | integer |  | Lookback window in days (default 90) |
+| `low_stock_threshold` | integer |  | Qty below which a variant is low (default 5) |
 
-**Mục đích**: Đo tốc độ xử lý đơn hàng (confirm + close), phát hiện đơn bị kẹt. Server tính từ timestamps của toàn bộ đơn trong kỳ.
+### `hrv_inventory_imbalance`
 
-**Input params**:
-| Param | Type | Default | Mô tả |
-|-------|------|---------|-------|
-| `date_from` | string | 30 ngày trước | Ngày bắt đầu |
-| `date_to` | string | Hôm nay | Ngày kết thúc |
+Detect cross-location imbalances (max/min > 5x)
 
-**Output — cấu trúc JSON**:
-```json
-{
-  "period": { "from": "2026-03-01", "to": "2026-03-31" },
-  "total_orders_analyzed": 1847,
-  "time_to_confirm_hours": {
-    "median": 2.1,
-    "p90": 8.4,
-    "mean": 3.2
-  },
-  "time_to_close_hours": {
-    "median": 52.0,
-    "p90": 96.0,
-    "mean": 58.4
-  },
-  "stuck_orders": {
-    "unconfirmed_gt_48h": 7,
-    "paid_not_fulfilled_gt_24h": 12,
-    "total_stuck": 19
-  }
-}
-```
+**Scopes:** `com.read_inventories, com.read_products`
 
-**Claude tự làm từ output này**:
-- **Processing Speed score**: So median với benchmark (<2h=10, 2-4h=8, 4-8h=6, >8h=3)
-- **Revenue at risk từ stuck**: `stuck_orders.paid_not_fulfilled_gt_24h × AOV` (AOV lấy từ orders_summary)
-- **Outlier detection**: `p90 / median > 3×` = có outlier đơn kẹt cực lâu, cần điều tra
-- **Bottleneck diagnosis**: Nếu time_to_confirm tốt nhưng time_to_close chậm → bottleneck ở fulfillment/shipping, không phải ops team
-- **SLA breach rate**: `stuck_orders.total_stuck / total_orders_analyzed × 100`
-- **Trend comparison**: Nếu gọi 2 kỳ → so sánh median để đánh giá cải thiện/xuống cấp
+_No parameters._
 
-**Khi nào DÙNG**: Phân tích pipeline, bottleneck xử lý đơn, đơn kẹt, tốc độ vận hành.
+### `hrv_order_cycle_time`
 
-**Khi nào KHÔNG dùng**: Khi chỉ cần tổng số đơn/doanh thu → `hrv_orders_summary`. Khi cần xem đơn cụ thể bị kẹt → `haravan_orders_list(status=open)`.
+Median/p90 time-to-confirm and time-to-close, plus stuck-order counts
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `date_from` | string (ISO 8601) |  | Start date ISO 8601 (default 30 days ago) |
+| `date_to` | string (ISO 8601) |  | End date ISO 8601 (default now) |
+
+### `hrv_orders_summary`
+
+Aggregate revenue/AOV/status breakdown with optional prior-period comparison
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `compare_prior` | boolean |  | Fetch prior equal-length window and add comparison (default true) |
+| `date_from` | string (ISO 8601) |  | Start date ISO 8601 (default: 30 days ago) |
+| `date_to` | string (ISO 8601) |  | End date ISO 8601 (default: now) |
+
+### `hrv_stock_reorder_plan`
+
+Reorder plan based on daily sales rate, lead time and safety factor
+
+**Scopes:** `com.read_inventories, com.read_products`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `date_range_days` | integer |  | Days of order history for DSR (default 30) |
+| `lead_time_days` | integer |  | Supplier lead time in days (default 7) |
+| `safety_factor` | string |  | Safety buffer multiplier (default 1.3) |
+
+### `hrv_top_products`
+
+Top N products by revenue with variant-level breakdown
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `date_from` | string (ISO 8601) |  | Start date ISO 8601 (default 30 days ago) |
+| `date_to` | string (ISO 8601) |  | End date ISO 8601 (default now) |
+| `top_n` | integer |  | Number of top products (default 10) |
 
 ---
 
-### 4. hrv_customer_segments
+## 📦 ORDERS  _(13 tool)_
 
-**Mục đích**: Phân khúc toàn bộ khách hàng theo RFM (Recency-Frequency-Monetary) bằng phương pháp quintile. Server cần xử lý toàn bộ customer + order history — không thể làm phía Claude.
+### `haravan_orders_assign`
 
-**Input params**:
-| Param | Type | Default | Mô tả |
-|-------|------|---------|-------|
-| `min_orders` | integer | 0 | Lọc chỉ khách có ≥N đơn (0 = tất cả) |
+Assign staff to an order
 
-**Output — cấu trúc JSON**:
-```json
-{
-  "total_customers": 922,
-  "analysis_date": "2026-04-06",
-  "segments": [
-    {
-      "name": "Champions",
-      "count": 45,
-      "pct": 4.9,
-      "total_revenue": 89200000,
-      "avg_order_value": 523000,
-      "avg_orders": 8.2,
-      "avg_days_since_last_order": 12,
-      "rfm_ranges": { "r": "4-5", "f": "4-5", "m": "4-5" },
-      "action_suggestion": "Loyalty program, early access, referral rewards"
-    },
-    {
-      "name": "Loyal",
-      "count": 67,
-      "pct": 7.3,
-      "total_revenue": 45100000,
-      "avg_order_value": 412000,
-      "avg_orders": 5.1,
-      "avg_days_since_last_order": 28,
-      "rfm_ranges": { "r": "3-5", "f": "4-5", "m": "3-5" },
-      "action_suggestion": "Cross-sell, upsell, tăng AOV"
-    },
-    {
-      "name": "Potential_Loyalists",
-      "count": 89,
-      "pct": 9.7,
-      "total_revenue": 22300000,
-      "avg_order_value": 289000,
-      "avg_orders": 2.3,
-      "avg_days_since_last_order": 21,
-      "rfm_ranges": { "r": "4-5", "f": "2-3", "m": "2-3" },
-      "action_suggestion": "Nurture: voucher mua lần 2-3, membership tier"
-    },
-    {
-      "name": "New_Customers",
-      "count": 156,
-      "pct": 16.9,
-      "total_revenue": 18900000,
-      "avg_order_value": 221000,
-      "avg_orders": 1.0,
-      "avg_days_since_last_order": 15,
-      "rfm_ranges": { "r": "4-5", "f": "1", "m": "1-3" },
-      "action_suggestion": "Welcome series, voucher mua lần 2"
-    },
-    {
-      "name": "At_Risk",
-      "count": 128,
-      "pct": 13.9,
-      "total_revenue": 34500000,
-      "avg_order_value": 467000,
-      "avg_orders": 4.8,
-      "avg_days_since_last_order": 112,
-      "rfm_ranges": { "r": "1-2", "f": "3-5", "m": "3-5" },
-      "action_suggestion": "Win-back NGAY: mã cá nhân, deadline rõ ràng"
-    },
-    {
-      "name": "Hibernating",
-      "count": 125,
-      "pct": 13.6,
-      "total_revenue": 8200000,
-      "avg_order_value": 198000,
-      "avg_orders": 2.1,
-      "avg_days_since_last_order": 198,
-      "rfm_ranges": { "r": "1-2", "f": "1-2", "m": "1-3" },
-      "action_suggestion": "Re-engagement offer mạnh, kèm deadline"
-    },
-    {
-      "name": "Lost",
-      "count": 312,
-      "pct": 33.9,
-      "total_revenue": 0,
-      "avg_order_value": 145000,
-      "avg_orders": 1.2,
-      "avg_days_since_last_order": 420,
-      "rfm_ranges": { "r": "1", "f": "1", "m": "1-2" },
-      "action_suggestion": "Archive, dùng làm lookalike audience ads"
-    }
-  ]
-}
-```
+**Scopes:** `com.write_orders`
 
-**Claude tự làm từ output này**:
-- **Repeat Purchase Rate**: `(total - New_Customers.count - Lost.count) / total × 100`
-- **Revenue concentration risk**: `Champions.total_revenue / SUM(all.total_revenue) × 100` — nếu >50% là rủi ro
-- **At Risk value**: Giá trị tiềm năng mất = `At_Risk.total_revenue`
-- **Win-back ROI estimate**: `At_Risk.count × At_Risk.avg_order_value × 20%` (20% recovery rate thực tế VN)
-- **New vs Returning split**: `New_Customers.total_revenue / total_revenue × 100` vs phần còn lại
-- **Retention health**: Champions% + Loyal% + Potential% / total = tỷ lệ khách đang tích cực
-- **Churn risk metric**: `(At_Risk + Hibernating).count / total × 100`
-- **LTV proxy per segment**: `avg_order_value × avg_orders` per segment
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID |
+| `user_id` | integer | **yes** | Staff user ID to assign |
 
-**Khi nào DÙNG**: RFM phân khúc, phân tích khách VIP, khách sắp mất, retention rate, acquisition vs retention split.
+### `haravan_orders_cancel`
 
-**Khi nào KHÔNG dùng**: Tìm kiếm khách cụ thể → `haravan_customers_search`. Xem lịch sử mua của 1 khách → `haravan_customers_get` + `haravan_orders_list`. Geography khách hàng → `haravan_customers_list` rồi group by province.
+Cancel an order. Reason must be one of: customer, fraud, inventory, declined, other.
 
----
+**Scopes:** `com.write_orders`
 
-### 5. hrv_inventory_health
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID to cancel |
+| `email` | boolean |  | Send cancellation email |
+| `reason` | string |  | Cancellation reason _(one of: customer, fraud, inventory, declined, other)_ |
+| `restock` | boolean |  | Restock cancelled items |
 
-**Mục đích**: Phân loại toàn bộ variants theo tình trạng tồn kho. Server cần 100-200 inventory API calls để fetch qty per variant — không thể làm phía Claude trong giới hạn token.
+### `haravan_orders_close`
 
-**Input params**:
-| Param | Type | Default | Mô tả |
-|-------|------|---------|-------|
-| `low_stock_threshold` | integer | 5 | Ngưỡng "sắp hết" (units) |
-| `days_for_dead_stock` | integer | 90 | Số ngày không bán = "dead stock" |
+Close an order
 
-**Output — cấu trúc JSON**:
-```json
-{
-  "summary": {
-    "total_variants_analyzed": 342,
-    "out_of_stock": 18,
-    "low_stock": 34,
-    "healthy": 245,
-    "dead_stock": 45,
-    "total_dead_stock_value": 23450000
-  },
-  "top_10_low_stock": [
-    {
-      "product_id": "11111",
-      "product_title": "Áo thun trắng",
-      "variant_id": "22222",
-      "variant_title": "M",
-      "sku": "ATT-M",
-      "qty_available": 2,
-      "daily_sales_rate": 3.1,
-      "days_of_stock": 0.6
-    }
-  ],
-  "top_10_dead_stock": [
-    {
-      "product_id": "33333",
-      "product_title": "Áo len đỏ",
-      "variant_id": "44444",
-      "variant_title": "XXL",
-      "sku": "ALD-XXL",
-      "qty_available": 45,
-      "last_sale_days_ago": 127,
-      "estimated_value": 17955000
-    }
-  ]
-}
-```
+**Scopes:** `com.write_orders`
 
-**Claude tự làm từ output này**:
-- **Stock-out Rate**: `out_of_stock / total_variants_analyzed × 100`
-- **Dead Stock %**: `dead_stock / total_variants_analyzed × 100`
-- **Revenue loss từ stock-out**: `out_of_stock_count × AOV × daily_sales_rate_avg` (ước tính)
-- **Capital tied up**: `total_dead_stock_value` — trực tiếp từ output
-- **Action prioritization**: Sort top_10_low_stock by `days_of_stock` → item nào hết trước
-- **Dead stock action matrix**: Value cao + days_ago lâu → flash sale. Value thấp → bundle/thanh lý
-- **Urgency flag**: `days_of_stock < 3` = CRITICAL (hết trước cuối tuần)
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID |
 
-**Khi nào DÙNG**: Sức khỏe tổng thể tồn kho, phát hiện SKU hết hàng, dead stock, trước khi ra quyết định nhập hàng.
+### `haravan_orders_confirm`
 
-**Khi nào KHÔNG dùng**: Khi cần kế hoạch nhập cụ thể (qty, timing) → `hrv_stock_reorder_plan`. Khi cần tồn kho theo từng location → `hrv_inventory_imbalance` hoặc `haravan_inventory_locations`.
+Confirm an order
+
+**Scopes:** `com.write_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID |
+
+### `haravan_orders_count`
+
+Get total order count with optional filters
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
+| `financial_status` | string |  | Financial status filter _(one of: pending, authorized, partially_paid, paid, partially_refunded, refunded, voided, any)_ |
+| `fulfillment_status` | string |  | Fulfillment status filter _(one of: fulfilled, partial, unshipped, any)_ |
+| `status` | string |  | Order status filter _(one of: open, closed, cancelled, any)_ |
+| `updated_at_max` | string (ISO 8601) |  | Updated before (ISO 8601) |
+| `updated_at_min` | string (ISO 8601) |  | Updated after (ISO 8601) |
+
+### `haravan_orders_create`
+
+Create a new order. Pass the Haravan order payload via --body as inline JSON or @file.
+The body MUST be wrapped as {"order": {...}}: line_items is required, billing/shipping
+addresses, tags, discount_codes, note, source_name are all supported.
+
+**Scopes:** `com.write_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Haravan order payload, e.g. {"order":{"line_items":[...]}} |
+
+### `haravan_orders_get`
+
+Get a single order by ID. Returns full order details including line_items, shipping, billing, transactions.
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID |
+| `fields` | string |  | Comma-separated fields |
+
+### `haravan_orders_list`
+
+List orders. Filter by status, financial_status, fulfillment_status, created_at, updated_at. Supports pagination.
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
+| `fetch_all` | boolean |  | Auto-paginate until all records are returned |
+| `fields` | string |  | Comma-separated fields to include |
+| `financial_status` | string |  | Financial status filter _(one of: pending, authorized, partially_paid, paid, partially_refunded, refunded, voided, any)_ |
+| `fulfillment_status` | string |  | Fulfillment status filter _(one of: fulfilled, partial, unshipped, any)_ |
+| `limit` | integer |  | Results per page (default 50, max 250) |
+| `page` | integer |  | Page number (default 1) |
+| `since_id` | integer |  | Results after this ID |
+| `status` | string |  | Order status filter _(one of: open, closed, cancelled, any)_ |
+| `updated_at_max` | string (ISO 8601) |  | Updated before (ISO 8601) |
+| `updated_at_min` | string (ISO 8601) |  | Updated after (ISO 8601) |
+
+### `haravan_orders_open`
+
+Reopen a closed order
+
+**Scopes:** `com.write_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID |
+
+### `haravan_orders_update`
+
+Update an existing order (note, tags, shipping_address, email, ...). Pass the payload via --body.
+
+**Scopes:** `com.write_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Haravan order patch, e.g. {"order":{"note":"..."}} |
+| `order_id` | integer | **yes** | Order ID |
+
+### `haravan_transactions_create`
+
+Create a transaction. Kind: Pending | Authorization | Sale | Capture | Void | Refund. Pass via --body.
+
+**Scopes:** `com.write_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Transaction payload, e.g. {"transaction":{"amount":100,"kind":"Sale"}} |
+| `order_id` | integer | **yes** | Order ID |
+
+### `haravan_transactions_get`
+
+Get a specific transaction
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID |
+| `transaction_id` | integer | **yes** | Transaction ID |
+
+### `haravan_transactions_list`
+
+List all transactions for an order
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `order_id` | integer | **yes** | Order ID |
 
 ---
 
-### 6. hrv_stock_reorder_plan
+## 🛒 PRODUCTS & VARIANTS  _(11 tool)_
 
-**Mục đích**: Tính toán kế hoạch nhập hàng cụ thể — DSR, reorder point, suggested quantity — cho tất cả variants sắp hết. Server tổng hợp sales history + current stock.
+### `haravan_products_count`
 
-**Input params**:
-| Param | Type | Default | Mô tả |
-|-------|------|---------|-------|
-| `lead_time_days` | integer | 7 | Số ngày từ lúc đặt hàng đến khi nhận hàng |
-| `safety_factor` | float | 1.3 | Hệ số an toàn (1.3 = buffer 30%) |
-| `date_range_days` | integer | 30 | Số ngày gần nhất để tính DSR |
+Get total product count with optional filters
 
-**Output — cấu trúc JSON**:
-```json
-{
-  "generated_at": "2026-04-06",
-  "params": { "lead_time_days": 7, "safety_factor": 1.3, "date_range_days": 30 },
-  "reorder_plan": [
-    {
-      "product_id": "11111",
-      "product_title": "Áo thun trắng",
-      "variant_id": "22222",
-      "variant_title": "M",
-      "sku": "ATT-M",
-      "qty_available": 2,
-      "daily_sales_rate": 3.1,
-      "days_of_stock": 0.6,
-      "reorder_point": 28,
-      "reorder_qty_suggested": 65,
-      "urgency": "CRITICAL"
-    },
-    {
-      "product_id": "55555",
-      "product_title": "Quần jean đen",
-      "variant_id": "66666",
-      "variant_title": "32",
-      "sku": "QJD-32",
-      "qty_available": 0,
-      "daily_sales_rate": 2.4,
-      "days_of_stock": 0,
-      "reorder_point": 22,
-      "reorder_qty_suggested": 49,
-      "urgency": "CRITICAL"
-    }
-  ]
-}
-```
+**Scopes:** `com.read_products`
 
-**Claude tự làm từ output này**:
-- **Urgency classification**: `days_of_stock < lead_time` = URGENT (sẽ hết trước khi hàng về). `days_of_stock < 2×lead_time` = SOON
-- **Total reorder investment estimate**: `SUM(reorder_qty_suggested × price)` — nếu có price từ products_list
-- **Priority order**: Sort by `days_of_stock` ASC (hết sớm nhất trước)
-- **Supplier grouping**: Group by vendor/supplier để gom đơn đặt hàng (từ products data)
-- **Weekly restock schedule**: Items với dos 7-14 ngày → đặt trong tuần này
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `collection_id` | integer |  | Filter by collection |
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
+| `handle` | string |  | Filter by handle (URL slug) |
+| `product_type` | string |  | Filter by product type |
+| `published_at_max` | string (ISO 8601) |  | Published before (ISO 8601) |
+| `published_at_min` | string (ISO 8601) |  | Published after (ISO 8601) |
+| `published_status` | string |  | Published status _(one of: published, unpublished, any)_ |
+| `updated_at_max` | string (ISO 8601) |  | Updated before (ISO 8601) |
+| `updated_at_min` | string (ISO 8601) |  | Updated after (ISO 8601) |
+| `vendor` | string |  | Filter by vendor |
 
-**Khi nào DÙNG**: Câu hỏi "cần nhập gì", "khi nào nhập", "bao nhiêu units", đề xuất PO.
+### `haravan_products_create`
 
-**Khi nào KHÔNG dùng**: Tổng quan kho (healthy/dead/out) → `hrv_inventory_health`. Cân bằng giữa các kho → `hrv_inventory_imbalance`.
+Create a product. Pass the full payload via --body (e.g. {"product":{"title":"T","variants":[...]}}). Title is required.
 
----
+**Scopes:** `com.write_products`
 
-### 7. hrv_inventory_imbalance
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Haravan product payload (wrapped or bare) |
 
-**Mục đích**: Phát hiện mất cân bằng tồn kho giữa nhiều chi nhánh/kho, đề xuất chuyển hàng. Cần fetch inventory data từ tất cả locations cho mỗi variant.
+### `haravan_products_delete`
 
-**Input params**: Không có params (tự động fetch toàn bộ multi-location data).
+Delete a product by ID
 
-**Output — cấu trúc JSON**:
-```json
-{
-  "generated_at": "2026-04-06",
-  "total_imbalanced_variants": 8,
-  "imbalanced_variants": [
-    {
-      "product_id": "11111",
-      "product_title": "Áo thun trắng",
-      "variant_id": "22222",
-      "variant_title": "M",
-      "sku": "ATT-M",
-      "imbalance_ratio": 23.5,
-      "total_qty": 49,
-      "locations": [
-        { "location_id": "loc_hn", "location_name": "Kho Hà Nội", "qty": 47 },
-        { "location_id": "loc_hcm", "location_name": "Kho HCM", "qty": 2 }
-      ],
-      "suggested_transfer": {
-        "from_location_id": "loc_hn",
-        "from_location_name": "Kho Hà Nội",
-        "to_location_id": "loc_hcm",
-        "to_location_name": "Kho HCM",
-        "qty": 22
-      }
-    }
-  ]
-}
-```
+**Scopes:** `com.write_products`
 
-**Claude tự làm từ output này**:
-- **Total transfers needed**: Count + tổng qty transfers
-- **Priority ranking**: Sort by `imbalance_ratio DESC` — imbalance cao nhất cần xử lý trước
-- **Transfer value estimate**: `suggested_transfer.qty × price` per item
-- **Operational grouping**: Group transfers by from_location → gom thành 1 lần vận chuyển
-- **Urgency layer**: Cross-reference với hrv_inventory_health — variant nào vừa imbalanced VỪA low_stock ở destination = URGENT
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `product_id` | integer | **yes** | Product ID to delete |
 
-**Khi nào DÙNG**: Shop có nhiều kho/chi nhánh, tối ưu phân bổ tồn kho, giảm stock-out tại điểm bán nóng.
+### `haravan_products_get`
 
-**Khi nào KHÔNG dùng**: Shop chỉ có 1 kho (tool không có ý nghĩa). Khi cần kế hoạch nhập từ supplier → `hrv_stock_reorder_plan`.
+Get a product by ID. Returns full details including variants, images, and options.
 
----
+**Scopes:** `com.read_products`
 
-## PHẦN II: BASE TOOLS — Nhóm theo danh mục
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `product_id` | integer | **yes** | Product ID |
+| `fields` | string |  | Comma-separated fields |
 
-Base tools mapping 1:1 với Haravan REST API. Dùng cho tra cứu cụ thể, drill-down sau smart tool, và thực hiện hành động (write).
+### `haravan_products_list`
 
----
+List all products with pagination and filtering (collection, type, vendor, handle, publish state, …).
 
-### ORDERS (Đơn hàng)
+**Scopes:** `com.read_products`
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_orders_list` | `status`, `date_from`, `date_to`, `limit`, `page`, `fields` | Drill-down đơn hàng, filter theo province/gateway/status cụ thể, COD analysis |
-| `haravan_orders_get` | `order_id` | Chi tiết 1 đơn: line_items, shipping, transactions, timeline |
-| `haravan_orders_create` | order object | Tạo đơn mới (rare, thường qua storefront) |
-| `haravan_orders_update` | `order_id`, fields update | Cập nhật thông tin đơn |
-| `haravan_orders_confirm` | `order_id` | **[Write]** Xác nhận đơn pending → processing |
-| `haravan_orders_cancel` | `order_id`, `reason` (customer/inventory/fraud/declined) | **[Write]** Hủy đơn |
-| `haravan_orders_close` | `order_id` | **[Write]** Đóng đơn hoàn thành |
-| `haravan_orders_open` | `order_id` | **[Write]** Mở lại đơn đã đóng |
-| `haravan_orders_assign` | `order_id`, `location_id` | **[Write]** Gán đơn cho kho/chi nhánh |
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `collection_id` | integer |  | Filter by collection |
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
+| `fetch_all` | boolean |  | Auto-paginate until all results are returned |
+| `fields` | string |  | Comma-separated fields |
+| `handle` | string |  | Filter by handle (URL slug) |
+| `limit` | integer |  | Results per page (max 250) |
+| `page` | integer |  | Page number |
+| `product_type` | string |  | Filter by product type |
+| `published_at_max` | string (ISO 8601) |  | Published before (ISO 8601) |
+| `published_at_min` | string (ISO 8601) |  | Published after (ISO 8601) |
+| `published_status` | string |  | Published status _(one of: published, unpublished, any)_ |
+| `since_id` | integer |  | Results after this ID |
+| `updated_at_max` | string (ISO 8601) |  | Updated before (ISO 8601) |
+| `updated_at_min` | string (ISO 8601) |  | Updated after (ISO 8601) |
+| `vendor` | string |  | Filter by vendor |
 
-**Lưu ý quan trọng**: `haravan_orders_list` có pagination (100 items/page). Không dùng để đếm/tổng hợp — dùng `hrv_orders_summary`. Chỉ dùng khi cần filter chi tiết mà smart tool không cung cấp (VD: orders by province, by gateway_code cụ thể).
+### `haravan_products_update`
 
-**Fields param tối ưu** cho các use case:
-- COD analysis: `fields=id,financial_status,gateway_code,shipping_address,total_price,cancelled_at`
-- Geographic analysis: `fields=id,shipping_address,total_price,financial_status,source_name`
-- Timeline: `fields=id,created_at,confirmed_at,closed_at,financial_status`
+Update an existing product
 
----
+**Scopes:** `com.write_products`
 
-### TRANSACTIONS (Giao dịch)
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Haravan product patch (wrapped or bare) |
+| `product_id` | integer | **yes** | Product ID |
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_transactions_list` | `order_id` | Xem lịch sử giao dịch của 1 đơn |
-| `haravan_transactions_get` | `order_id`, `transaction_id` | Chi tiết 1 giao dịch |
-| `haravan_transactions_create` | `order_id`, `kind` (Capture/Refund), `amount` | **[Write]** Ghi nhận thanh toán, hoàn tiền |
+### `haravan_variants_count`
 
----
+Count variants of a product
 
-### PRODUCTS (Sản phẩm)
+**Scopes:** `com.read_products`
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_products_list` | `limit`, `page`, `fields`, `product_type`, `vendor` | Browse catalog, catalog health scoring (fetch all) |
-| `haravan_products_count` | filters | Đếm sản phẩm |
-| `haravan_products_get` | `product_id` | Chi tiết đầy đủ: images, variants, SEO, metafields |
-| `haravan_products_create` | product object | **[Write]** Tạo sản phẩm mới |
-| `haravan_products_update` | `product_id`, fields | **[Write]** Cập nhật sản phẩm |
-| `haravan_products_delete` | `product_id` | **[Write]** Xóa sản phẩm |
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `product_id` | integer | **yes** | Product ID |
 
-**Fields param cho catalog health scoring**:
-`fields=id,title,body_html,product_type,vendor,tags,images,variants,status`
+### `haravan_variants_create`
+
+Create a variant for a product
+
+**Scopes:** `com.write_products`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Variant payload, e.g. {"variant":{"price":99000,"sku":"X"}} |
+| `product_id` | integer | **yes** | Product ID |
+
+### `haravan_variants_get`
+
+Fetches /com/variants/{variant_id}.json — no product_id required.
+
+**Scopes:** `com.read_products`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `variant_id` | integer | **yes** | Variant ID |
+| `fields` | string |  | Comma-separated fields |
+
+### `haravan_variants_list`
+
+List variants of a product
+
+**Scopes:** `com.read_products`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `product_id` | integer | **yes** | Product ID |
+| `fields` | string |  | Comma-separated fields |
+| `limit` | integer |  | Results per page |
+| `page` | integer |  | Page number |
+
+### `haravan_variants_update`
+
+Updates /com/variants/{variant_id}.json. The legacy TS API requires only the variant_id, not the parent product.
+
+**Scopes:** `com.write_products`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Variant patch (wrapped or bare) |
+| `variant_id` | integer | **yes** | Variant ID |
 
 ---
 
-### VARIANTS (Biến thể)
+## 👥 CUSTOMERS & ADDRESSES  _(14 tool)_
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_variants_list` | `product_id` | Danh sách variants của 1 sản phẩm |
-| `haravan_variants_count` | `product_id` | Đếm variants |
-| `haravan_variants_get` | `product_id`, `variant_id` | Chi tiết variant: price, SKU, barcode, inventory |
-| `haravan_variants_create` | `product_id`, variant object | **[Write]** Thêm variant mới |
-| `haravan_variants_update` | `product_id`, `variant_id`, fields | **[Write]** Cập nhật variant (giá, SKU, barcode) |
+### `haravan_customer_addresses_create`
+
+Create a new address for a customer
+
+**Scopes:** `com.write_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Address payload (wrapped or bare) |
+| `customer_id` | integer | **yes** | Customer ID |
+
+### `haravan_customer_addresses_delete`
+
+Delete a customer address
+
+**Scopes:** `com.write_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `address_id` | integer | **yes** | Address ID |
+| `customer_id` | integer | **yes** | Customer ID |
+
+### `haravan_customer_addresses_get`
+
+Get a specific address of a customer
+
+**Scopes:** `com.read_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `address_id` | integer | **yes** | Address ID |
+| `customer_id` | integer | **yes** | Customer ID |
+
+### `haravan_customer_addresses_list`
+
+List addresses of a customer
+
+**Scopes:** `com.read_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `customer_id` | integer | **yes** | Customer ID |
+| `limit` | integer |  | Results per page |
+| `page` | integer |  | Page number |
+
+### `haravan_customer_addresses_set_default`
+
+Set a customer address as default
+
+**Scopes:** `com.write_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `address_id` | integer | **yes** | Address ID to set as default |
+| `customer_id` | integer | **yes** | Customer ID |
+
+### `haravan_customer_addresses_update`
+
+Update a customer address
+
+**Scopes:** `com.write_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `address_id` | integer | **yes** | Address ID |
+| `body` | any | **yes** | Address patch (wrapped or bare) |
+| `customer_id` | integer | **yes** | Customer ID |
+
+### `haravan_customers_count`
+
+Count customers with date filters
+
+**Scopes:** `com.read_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
+| `updated_at_max` | string (ISO 8601) |  | Updated before (ISO 8601) |
+| `updated_at_min` | string (ISO 8601) |  | Updated after (ISO 8601) |
+
+### `haravan_customers_create`
+
+Create a customer. Email OR phone is required. Pass the payload via --body (e.g. {"customer":{"email":"x@y.z"}}).
+
+**Scopes:** `com.write_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Customer payload (wrapped or bare) |
+
+### `haravan_customers_delete`
+
+Delete a customer by ID
+
+**Scopes:** `com.write_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `customer_id` | integer | **yes** | Customer ID |
+
+### `haravan_customers_get`
+
+Get a single customer by ID
+
+**Scopes:** `com.read_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `customer_id` | integer | **yes** | Customer ID |
+| `fields` | string |  | Comma-separated fields |
+
+### `haravan_customers_groups`
+
+List all customer groups
+
+**Scopes:** `com.read_customers`
+
+_No parameters._
+
+### `haravan_customers_list`
+
+List customers with pagination and date filters.
+
+**Scopes:** `com.read_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
+| `fetch_all` | boolean |  | Auto-paginate to fetch every page |
+| `fields` | string |  | Comma-separated fields |
+| `limit` | integer |  | Results per page (max 250) |
+| `page` | integer |  | Page number |
+| `since_id` | integer |  | Results after this ID |
+| `updated_at_max` | string (ISO 8601) |  | Updated before (ISO 8601) |
+| `updated_at_min` | string (ISO 8601) |  | Updated after (ISO 8601) |
+
+### `haravan_customers_search`
+
+Search customers (email, phone, name, …)
+
+**Scopes:** `com.read_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `query` | string | **yes** | Search query |
+| `fields` | string |  | Comma-separated fields |
+| `limit` | integer |  | Results per page |
+| `page` | integer |  | Page number |
+
+### `haravan_customers_update`
+
+Update an existing customer
+
+**Scopes:** `com.write_customers`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Customer patch (wrapped or bare) |
+| `customer_id` | integer | **yes** | Customer ID |
 
 ---
 
-### CUSTOMERS (Khách hàng)
+## 📊 INVENTORY  _(5 tool)_
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_customers_list` | `limit`, `page`, `fields` | Browse khách hàng, geographic analysis |
-| `haravan_customers_search` | `query` (tên/email/SĐT) | Tìm khách cụ thể |
-| `haravan_customers_count` | filters | Đếm khách |
-| `haravan_customers_get` | `customer_id` | Chi tiết khách: orders, addresses, tags |
-| `haravan_customers_create` | customer object | **[Write]** Tạo khách mới |
-| `haravan_customers_update` | `customer_id`, fields | **[Write]** Cập nhật thông tin khách |
-| `haravan_customers_delete` | `customer_id` | **[Write]** Xóa khách (cẩn thận!) |
-| `haravan_customers_groups` | — | Danh sách nhóm khách hàng |
-| `haravan_customer_addresses_list` | `customer_id` | Địa chỉ của khách |
+### `haravan_inventory_adjust_or_set`
 
----
+Create an inventory adjustment. type=adjust adds or subtracts quantities,
+type=set replaces them. Max 200 line items per request.
+Pass the line_items and reason via --body.
 
-### INVENTORY (Tồn kho)
+**Scopes:** `com.write_inventories`
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_inventory_adjustments_list` | `location_id`, `date` | Lịch sử điều chỉnh tồn kho |
-| `haravan_inventory_adjustments_get` | `adjustment_id` | Chi tiết 1 lần điều chỉnh |
-| `haravan_inventory_adjust_or_set` | `variant_id`, `location_id`, `qty`, `type` (adjust/set) | **[Write]** Điều chỉnh hoặc set tồn kho tuyệt đối |
-| `haravan_inventory_locations` | `variant_id` | Tồn kho của 1 variant tại tất cả locations |
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Line items, e.g. {"line_items":[{"product_id":1,"product_variant_id":2,"quantity":5}]} |
+| `location_id` | integer | **yes** | Location/warehouse ID |
+| `note` | string |  | Adjustment note |
+| `reason` | string |  | Adjustment reason _(one of: newproduct, returned, productionofgoods, damaged, shrinkage, promotion, transfer)_ |
+| `tags` | string |  | Comma-separated tags |
+| `type` | string |  | adjust\|set (default adjust) _(one of: adjust, set)_ |
 
----
+### `haravan_inventory_adjustments_count`
 
-### SHOP & LOCATIONS (Cửa hàng)
+Count inventory adjustments
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_shop_get` | — | Thông tin shop: name, domain, currency, timezone, plan |
-| `haravan_locations_list` | — | Danh sách kho/chi nhánh |
-| `haravan_locations_get` | `location_id` | Chi tiết 1 location |
-| `haravan_users_list` | — | Danh sách staff/user (cần Plus plan) |
-| `haravan_users_get` | `user_id` | Chi tiết 1 user |
-| `haravan_shipping_rates_get` | — | Phương thức vận chuyển đang cấu hình |
+**Scopes:** `com.read_inventories`
 
----
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
 
-### CONTENT (Nội dung)
+### `haravan_inventory_adjustments_get`
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_pages_list` | — | Danh sách trang tĩnh |
-| `haravan_pages_get` | `page_id` | Chi tiết trang |
-| `haravan_pages_create` | page object | **[Write]** Tạo trang mới |
-| `haravan_pages_update` | `page_id`, fields | **[Write]** Cập nhật trang |
-| `haravan_pages_delete` | `page_id` | **[Write]** Xóa trang |
-| `haravan_blogs_list` | — | Danh sách blogs |
-| `haravan_blogs_get` | `blog_id` | Chi tiết blog |
-| `haravan_articles_list` | `blog_id` | Danh sách bài viết trong blog |
-| `haravan_articles_get` | `blog_id`, `article_id` | Chi tiết bài viết |
-| `haravan_articles_create` | `blog_id`, article object | **[Write]** Tạo bài viết mới |
-| `haravan_articles_update` | `blog_id`, `article_id`, fields | **[Write]** Cập nhật bài viết |
-| `haravan_articles_delete` | `blog_id`, `article_id` | **[Write]** Xóa bài viết |
-| `haravan_script_tags_list` | — | Danh sách script tags |
-| `haravan_script_tags_create` | `src`, `event` | **[Write]** Thêm script tag |
-| `haravan_script_tags_delete` | `script_tag_id` | **[Write]** Xóa script tag |
+Get a single inventory adjustment by ID
 
----
+**Scopes:** `com.read_inventories`
 
-### WEBHOOKS
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `adjustment_id` | integer | **yes** | Adjustment ID |
 
-| Tool | Params chính | Dùng khi |
-|------|-------------|---------|
-| `haravan_webhooks_list` | — | Danh sách webhooks đang active |
-| `haravan_webhooks_get` | `webhook_id` | Chi tiết 1 webhook |
-| `haravan_webhooks_create` | `topic`, `address`, `format` | **[Write]** Tạo webhook mới |
-| `haravan_webhooks_update` | `webhook_id`, fields | **[Write]** Cập nhật webhook |
-| `haravan_webhooks_delete` | `webhook_id` | **[Write]** Xóa webhook |
+### `haravan_inventory_adjustments_list`
+
+List inventory adjustments with pagination and date filters.
+
+**Scopes:** `com.read_inventories`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `created_at_max` | string (ISO 8601) |  | Created before (ISO 8601) |
+| `created_at_min` | string (ISO 8601) |  | Created after (ISO 8601) |
+| `fetch_all` | boolean |  | Auto-paginate to fetch every page |
+| `limit` | integer |  | Results per page |
+| `page` | integer |  | Page number |
+| `since_id` | integer |  | Results after this ID |
+
+### `haravan_inventory_locations`
+
+Get inventory levels by location / variant / product
+
+**Scopes:** `com.read_inventories`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `limit` | integer |  | Results per page |
+| `location_id` | integer |  | Filter by location ID |
+| `page` | integer |  | Page number |
+| `product_id` | integer |  | Filter by product ID |
+| `variant_id` | integer |  | Filter by variant ID |
 
 ---
 
-## PHẦN III: Bảng quyết định — Smart Tool vs Base Tool vs Claude tự làm
+## 🏪 SHOP / LOCATIONS / USERS  _(6 tool)_
 
-| Phân tích cần làm | Cách tối ưu |
-|-------------------|------------|
-| Tổng DT, số đơn, AOV | `hrv_orders_summary` — 1 call |
-| Channel breakdown (web/POS/mobile) | **Claude tự tính** từ `hrv_orders_summary.orders_by_source` |
-| Cancel rate + lý do hủy | **Claude tự tính** từ `hrv_orders_summary` |
-| ODR (Order Defect Rate) | **Claude tự tính** từ `hrv_orders_summary` |
-| Discount penetration + depth | **Claude tự tính** từ `hrv_orders_summary.discount_usage` |
-| Sản phẩm bán chạy nhất | `hrv_top_products` — 1 call |
-| Tốc độ xử lý đơn, đơn kẹt | `hrv_order_cycle_time` — 1 call |
-| RFM segments, retention rate | `hrv_customer_segments` — 1 call |
-| Repeat purchase rate | **Claude tự tính** từ `hrv_customer_segments` |
-| Tổng quan sức khỏe kho | `hrv_inventory_health` — 1 call |
-| Kế hoạch nhập hàng cụ thể | `hrv_stock_reorder_plan` — 1 call |
-| Cân bằng kho đa chi nhánh | `hrv_inventory_imbalance` — 1 call |
-| Catalog health score | **Claude tự score** từ `haravan_products_list` |
-| Geographic revenue | **Claude tự group** từ `haravan_orders_list` (filter fields) |
-| COD fail rate tổng quát | **Claude tự ước tính** từ `hrv_orders_summary` |
-| COD fail rate by province | `haravan_orders_list` + Claude filter/group |
-| Per-code discount ROI | `haravan_orders_list` + Claude parse discount_codes |
-| Operations scorecard (all dims) | 4 smart tools song song + **Claude chấm điểm** |
+### `haravan_locations_get`
+
+Get a single location by ID
+
+**Scopes:** `com.read_shop`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `location_id` | integer | **yes** | Location ID |
+
+### `haravan_locations_list`
+
+List all locations/warehouses
+
+**Scopes:** `com.read_shop`
+
+_No parameters._
+
+### `haravan_shipping_rates_get`
+
+Get available shipping rates for a destination address. Pass address fields via the --address-* flags; at least one is typically required by the endpoint.
+
+**Scopes:** `com.read_orders`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `address1` | string |  | Street address |
+| `city` | string |  | City |
+| `country` | string |  | Country |
+| `province` | string |  | Province |
+| `zip` | string |  | ZIP / postal code |
+
+### `haravan_shop_get`
+
+Get shop information: name, domain, email, currency, timezone, plan, address, checkout settings.
+
+**Scopes:** `com.read_shop`
+
+_No parameters._
+
+### `haravan_users_get`
+
+Get a single user by ID (Haravan Plus only)
+
+**Scopes:** `com.read_shop`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | integer | **yes** | User ID |
+
+### `haravan_users_list`
+
+List all shop staff users (Haravan Plus only)
+
+**Scopes:** `com.read_shop`
+
+_No parameters._
+
+---
+
+## 📝 CONTENT (Pages / Blogs / Articles / Script tags)  _(11 tool)_
+
+### `haravan_articles_get`
+
+Get a single article
+
+**Scopes:** `web.read_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `article_id` | integer | **yes** | Article ID |
+| `blog_id` | integer | **yes** | Blog ID |
+
+### `haravan_articles_list`
+
+List articles of a blog
+
+**Scopes:** `web.read_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `blog_id` | integer | **yes** | Blog ID |
+| `limit` | integer |  | Results per page |
+| `page` | integer |  | Page number |
+
+### `haravan_blogs_list`
+
+List all blogs
+
+**Scopes:** `web.read_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `limit` | integer |  | Results per page |
+| `page` | integer |  | Page number |
+
+### `haravan_pages_create`
+
+Pass the payload via --body (e.g. {"page":{"title":"About","body_html":"..."}}).
+
+**Scopes:** `web.write_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Page payload (wrapped or bare) |
+
+### `haravan_pages_delete`
+
+Delete a page
+
+**Scopes:** `web.write_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `page_id` | integer | **yes** | Page ID |
+
+### `haravan_pages_get`
+
+Get a single page by ID
+
+**Scopes:** `web.read_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `page_id` | integer | **yes** | Page ID |
+
+### `haravan_pages_list`
+
+List pages
+
+**Scopes:** `web.read_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `fields` | string |  | Comma-separated fields |
+| `limit` | integer |  | Results per page |
+| `page` | integer |  | Page number |
+| `since_id` | integer |  | Results after this ID |
+
+### `haravan_pages_update`
+
+Update a page
+
+**Scopes:** `web.write_contents`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Page patch (wrapped or bare) |
+| `page_id` | integer | **yes** | Page ID |
+
+### `haravan_script_tags_create`
+
+Requires an HTTPS src URL. Pass via --body: {"script_tag":{"event":"onload","src":"https://…"}}.
+
+**Scopes:** `web.write_script_tags`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `body` | any | **yes** | Script tag payload (wrapped or bare) |
+
+### `haravan_script_tags_delete`
+
+Delete a script tag
+
+**Scopes:** `web.write_script_tags`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `script_tag_id` | integer | **yes** | Script tag ID |
+
+### `haravan_script_tags_list`
+
+List script tags
+
+**Scopes:** `web.read_script_tags`
+
+_No parameters._
+
+---
+
+## 🔔 WEBHOOKS  _(3 tool)_
+
+### `haravan_webhooks_list`
+
+List all webhook subscriptions for the current app (hits webhook.haravan.com, not the main API).
+
+**Scopes:** `wh_api`
+
+_No parameters._
+
+### `haravan_webhooks_subscribe`
+
+Subscribe the app to a webhook topic. Valid topics include:
+orders/create, orders/updated, orders/paid, orders/cancelled, orders/fulfilled,
+products/create, products/update, products/delete,
+customers/create, customers/update, customers/delete,
+shop/update, user/update, app/uninstalled.
+
+The app must have a verified callback URL configured in the Developer Dashboard.
+
+**Scopes:** `wh_api`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `topic` | string |  | Webhook topic, e.g. orders/create |
+
+### `haravan_webhooks_unsubscribe`
+
+Unsubscribe from a webhook topic
+
+**Scopes:** `wh_api`
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `topic` | string |  | Webhook topic to unsubscribe |
+
+---
+
+## Tổng: 70 tool
+
+| Nhóm | Số tool | Ghi chú |
+|---|---|---|
+| 🧠 Smart | 7 | Aggregate server-side, dùng cho summary & RFM & inventory analytics |
+| 📦 Orders | 13 | List/count/get/create/update + status transitions + transactions |
+| 🛒 Products | 11 | Products CRUD + variants CRUD |
+| 👥 Customers | 14 | Customers CRUD + groups + addresses CRUD + set_default |
+| 📊 Inventory | 5 | Adjustments list/count/get + adjust_or_set + locations |
+| 🏪 Shop | 6 | Shop info, locations, users (Plus), shipping rates |
+| 📝 Content | 11 | Pages CRUD, blogs list, articles list/get, script tags |
+| 🔔 Webhooks | 3 | list / subscribe / unsubscribe (API Haravan dùng topic, không phải webhook_id) |
